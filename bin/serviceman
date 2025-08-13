@@ -41,6 +41,8 @@ fn_help() { (
     echo "    serviceman start 'foo-app'"
     echo "    serviceman stop 'foo-app'"
     echo "    serviceman restart 'foo-app'"
+    echo "    serviceman rm 'foo-app'"
+    echo "    serviceman update"
     echo ""
     echo "    serviceman help"
     echo "    serviceman version"
@@ -104,6 +106,16 @@ fn_add_help() { (
     echo "    pg:      serviceman add --workdir ~/.local/share/postgres/var -- postgres -D ~/.local/share/postgres/var -p 5432"
     echo "    python:  serviceman add --name 'thing' -- python3 ./thing.py"
     echo "    shell:   serviceman add --name 'foo' -- ./foo.sh --bar ./baz"
+    echo ""
+); }
+
+fn_rm_help() { (
+    echo ""
+    echo "USAGE"
+    echo "    serviceman rm <service-name>"
+    echo ""
+    echo "DESCRIPTION"
+    echo "    Stops, disables, and permanently removes a service."
     echo ""
 ); }
 
@@ -446,7 +458,7 @@ cmd_add() { (
     if test -z "${b_name}"; then
         if test -n "${b_interpreter}"; then
             # ex: use the workdir name for node or python
-            b_name="$(basename "${b_workdir}")"
+            b_name=$(defaults read "${b_f%.plist}" Label 2>/dev/null || basename "${b_f}" .plist)
         else
             # ex: use the bin name for caddy or postgres
             b_name="${b_exec}"
@@ -1177,7 +1189,14 @@ cmd_list() { (
             echo ""
             echo "${b_path}: (Generated for serviceman)"
             echo ""
-            b_list="$(grep -i 'Generated for serviceman' "${b_path}"/* 2> /dev/null | cut -d':' -f1 | rev | cut -d'/' -f1 | rev)"
+            b_list="$(grep -l -i 'Generated for serviceman' "${b_path}"/* 2> /dev/null)"
+            if command -v launchctl > /dev/null; then
+                for b_file in ${b_list}; do
+                    b_name=$(defaults read "${b_file%.plist}" Label 2>/dev/null || basename "${b_file}")
+                    echo "    ${b_name}"
+                done
+                b_list=''
+            fi
             if test -z "${b_list}"; then
                 echo "    (none)"
             else
@@ -1200,10 +1219,15 @@ cmd_list() { (
             if ! grep -q -F "${b_header}" "${b_file}" 2> /dev/null; then
                 continue
             fi
+            b_name="$(basename "${b_file}")"
+            if command -v launchctl > /dev/null; then
+                b_name=$(defaults read "${b_file%.plist}" Label 2>/dev/null || basename "${b_file}")
+            fi
+
             if grep -q -i 'Generated for serviceman' "${b_file}" 2> /dev/null; then
-                echo "    $(basename "${b_file}")*"
+                echo "    ${b_name}*"
             else
-                echo "    $(basename "${b_file}")"
+                echo "    ${b_name}"
             fi
         done
         echo ""
@@ -1393,12 +1417,50 @@ cmd_stop() { (
     fi
 
     if command -v launchctl > /dev/null; then
+        b_macos_version="$(sw_vers -productVersion)"
+        b_major_version="$(echo "${b_macos_version}" | cut -d. -f1)"
+        b_is_daemon=0
         if test -n "${b_boot_daemon}"; then
-            echo ${cmd_sudo} launchctl unload /Library/LaunchDaemons/"${b_name}".plist
-            ${cmd_sudo} launchctl unload /Library/LaunchDaemons/"${b_name}".plist
+            b_is_daemon=1
+        fi
+
+        if [ "${b_major_version}" -ge 15 ]; then
+            b_plist_path=''
+            b_domain_prefix=''
+            b_current_sudo=""
+            if [ ${b_is_daemon} -eq 1 ]; then
+                b_plist_path="/Library/LaunchDaemons/${b_name}.plist"
+                b_domain_prefix="system"
+                b_current_sudo="${cmd_sudo}"
+            else
+                b_plist_path="${HOME}/Library/LaunchAgents/${b_name}.plist"
+                b_domain_prefix="gui/$(id -u)"
+            fi
+
+            if ! test -f "${b_plist_path}"; then
+                echo >&2 "error: service file not found at '${b_plist_path}'"
+                return 1
+            fi
+            
+            b_plist_path_no_ext="$(echo "${b_plist_path}" | sed -E 's/(\.plist)$//')"
+            b_label="$(${b_current_sudo} defaults read "${b_plist_path_no_ext}" Label 2>/dev/null || echo '')"
+            if test -z "${b_label}"; then
+                echo >&2 "warn: could not read Label from '${b_plist_path}'. Using service name as fallback."
+                b_label="${b_name}"
+            fi
+
+            b_service_target="${b_domain_prefix}/${b_label}"
+            echo "${b_current_sudo} launchctl bootout '${b_service_target}'"
+            ${b_current_sudo} launchctl bootout "${b_service_target}"
         else
-            echo launchctl unload ~/Library/LaunchAgents/"${b_name}".plist
-            launchctl unload ~/Library/LaunchAgents/"${b_name}".plist
+            # Legacy macOS
+            if [ ${b_is_daemon} -eq 1 ]; then
+                echo ${cmd_sudo} launchctl unload "/Library/LaunchDaemons/${b_name}.plist"
+                ${cmd_sudo} launchctl unload "/Library/LaunchDaemons/${b_name}.plist"
+            else
+                echo launchctl unload "${HOME}/Library/LaunchAgents/${b_name}.plist"
+                launchctl unload "${HOME}/Library/LaunchAgents/${b_name}.plist"
+            fi
         fi
         return 0
     fi
@@ -1634,6 +1696,70 @@ cmd_enable() { (
     return 1
 ); }
 
+cmd_rm() { (
+    b_name="${1:-}"
+    if test -z "${b_name}"; then
+        echo >&2 "error: missing service name"
+        fn_rm_help
+        return 1
+    fi
+
+    echo "Disabling '${b_name}'..."
+    cmd_disable "${@:-}"
+
+    echo "Removing '${b_name}'..."
+    if command -v systemctl > /dev/null; then
+        if test -f "/etc/systemd/system/${b_name}.service"; then
+            echo ${cmd_sudo} rm "/etc/systemd/system/${b_name}.service"
+            ${cmd_sudo} rm "/etc/systemd/system/${b_name}.service"
+        elif test -f "${HOME}/.config/systemd/user/${b_name}.service"; then
+            echo rm "${HOME}/.config/systemd/user/${b_name}.service"
+            rm "${HOME}/.config/systemd/user/${b_name}.service"
+        else
+            echo >&2 "warn: could not find service file for '${b_name}'"
+        fi
+        return 0
+    fi
+
+    if command -v launchctl > /dev/null; then
+        # find the plist by name
+        b_plist_path=""
+        if test -f "${HOME}/Library/LaunchAgents/${b_name}.plist"; then
+            b_plist_path="${HOME}/Library/LaunchAgents/${b_name}.plist"
+        elif test -f "/Library/LaunchDaemons/${b_name}.plist"; then
+            b_plist_path="/Library/LaunchDaemons/${b_name}.plist"
+        else
+            # find the plist by rdns name
+            for f in "${HOME}/Library/LaunchAgents/"*.plist; do
+                if test "$(defaults read "${f%.plist}" Label)" = "${b_name}"; then
+                    b_plist_path="$f"
+                    break
+                fi
+            done
+            if test -z "${b_plist_path}"; then
+                for f in /Library/LaunchDaemons/*.plist; do
+                    if test "$(${cmd_sudo} defaults read "${f%.plist}" Label)" = "${b_name}"; then
+                        b_plist_path="$f"
+                        break
+                    fi
+                done
+            fi
+        fi
+
+        if test -n "${b_plist_path}"; then
+            echo rm "${b_plist_path}"
+            rm "${b_plist_path}"
+        else
+            echo >&2 "warn: could not find .plist for '${b_name}'"
+        fi
+        return 0
+    fi
+
+    # For openrc, 'disable' already removes it, so we just note that.
+    echo "'${b_name}' has been removed from openrc by 'disable'."
+
+); }
+
 cmd_disable() { (
     b_state='disable'
 
@@ -1741,6 +1867,45 @@ cmd_disable() { (
 
     echo >&2 'error: could not detect systemd, openrc, or launchctl'
     return 1
+); }
+
+cmd_update() { (
+    b_self_path=""
+    if ! b_self_path="$(command -v "serviceman")"; then
+        echo >&2 "error: could not find 'serviceman' in your PATH. Please update manually."
+        return 1
+    fi
+
+    echo "Updating serviceman located at '${b_self_path}'..."
+
+    b_url='https://raw.githubusercontent.com/bnnanet/serviceman-sh/main/bin/serviceman'
+    b_tmp_file="$(mktemp)"
+
+    if ! curl -LfsS "${b_url}" -o "${b_tmp_file}"; then
+        echo >&2 "error: failed to download update."
+        rm "${b_tmp_file}"
+        return 1
+    fi
+
+    b_new_version=$(grep "^g_version=" "${b_tmp_file}" | cut -d"'" -f2)
+    if test "${g_version}" = "${b_new_version}"; then
+        echo "You are already on the latest version: ${g_version}"
+        rm "${b_tmp_file}"
+        return 0
+    fi
+
+    chmod +x "${b_tmp_file}"
+    if ! mv "${b_tmp_file}" "${b_self_path}"; then
+        echo >&2 "error: failed to move new version into place. Try with sudo?"
+        # try to clean up temp file if we can
+        if test -f "${b_tmp_file}"; then
+            rm "${b_tmp_file}"
+        fi
+        return 1
+    fi
+
+    echo "Successfully updated to ${b_new_version}!"
+
 ); }
 
 cmd_logs() { (
@@ -1860,6 +2025,8 @@ main() { (
         restart) cmd_restart "${@:-}" ;;
         enable) cmd_enable "${@:-}" ;;
         disable) cmd_disable "${@:-}" ;;
+        rm | remove) cmd_rm "${@:-}" ;;
+        update) cmd_update "${@:-}" ;;
         logs) cmd_logs "${@:-}" ;;
         __noop__) ;; # to be able to source without running
         help | --help) fn_help ;;
